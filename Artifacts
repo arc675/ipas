@@ -1,0 +1,160 @@
+name: iOS Framework Triage (AddressDoctor)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_path:
+        description: "Path to a single IPA (e.g. ipas/Tile.ipa). If empty, process all ipas/*.ipa"
+        required: false
+        default: ""
+  push:
+    paths:
+      - "ipas/*.ipa"
+      - ".github/workflows/ios-framework-triage.yml"
+
+jobs:
+  triage:
+    runs-on: macos-latest  # Needed for otool, lipo, codesign, plutil
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find IPA(s)
+        id: find
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ github.event.inputs.ipa_path }}" ]]; then
+            echo "ipalist=${{ github.event.inputs.ipa_path }}" >> "$GITHUB_OUTPUT"
+          else
+            shopt -s nullglob
+            FILES=(ipas/*.ipa)
+            if (( ${#FILES[@]} == 0 )); then
+              echo "No IPA files found in ipas/. Provide one via workflow input or commit under ipas/." >&2
+              exit 1
+            fi
+            echo "ipalist=${FILES[*]}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Will process: $(cat $GITHUB_OUTPUT)"
+
+      - name: Write one-shot script
+        shell: bash
+        run: |
+          cat > ios_framework_one_shot.sh <<'BASH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          IFS=$'\n\t'
+          usage(){ echo "Usage: $0 --ipa PATH_TO_IPA"; }
+          IPA=""
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --ipa) IPA="${2:-}"; shift 2;;
+              *) echo "Unknown arg $1"; usage; exit 1;;
+            esac
+          done
+          [[ -z "$IPA" ]] && { usage; exit 1; }
+          for c in unzip file otool nm strings plutil codesign awk sed grep shasum; do
+            command -v "$c" >/dev/null || { echo "Missing $c"; exit 1; }
+          done
+          command -v lipo >/dev/null && HAVE_LIPO=1 || HAVE_LIPO=0
+          command -v dwarfdump >/dev/null && HAVE_DWARFDUMP=1 || HAVE_DWARFDUMP=0
+          command -v swift-demangle >/dev/null && HAVE_SWIFT_DEMANGLE=1 || HAVE_SWIFT_DEMANGLE=0
+
+          ts(){ date +"%Y-%m-%d_%H-%M-%S"; }
+          WORKDIR="$(mktemp -d -t addrdoctor_XXXXXX)"
+          trap 'rm -rf "$WORKDIR"' EXIT
+
+          [[ -f "$IPA" ]] || { echo "IPA not found: $IPA"; exit 1; }
+
+          UNZIP_DIR="$WORKDIR/ipa"
+          mkdir -p "$UNZIP_DIR"
+          unzip -q "$IPA" -d "$UNZIP_DIR"
+
+          APP_PATH="$(/usr/bin/find "$UNZIP_DIR" -maxdepth 3 -type d -name "*.app" | head -n 1 || true)"
+          [[ -n "$APP_PATH" ]] || { echo "No .app inside IPA"; exit 1; }
+
+          FW_DIR="$(/usr/bin/find "$APP_PATH/Frameworks" -type d -name "AddressDoctor.framework" 2>/dev/null | head -n 1 || true)"
+          [[ -n "$FW_DIR" ]] || { echo "AddressDoctor.framework not found under $(basename "$APP_PATH")/Frameworks"; exit 2; }
+          BIN="$FW_DIR/AddressDoctor"
+          [[ -f "$BIN" ]] || { echo "AddressDoctor binary missing"; exit 2; }
+
+          OUTDIR="AddressDoctor_report_$(ts)"
+          mkdir -p "$OUTDIR"
+          cp -R "$FW_DIR" "$OUTDIR/AddressDoctor.framework"
+
+          {
+            echo "== FILE & HASHES =="
+            echo "IPA: $IPA"
+            echo "Binary: $BIN"
+            echo -n "Size: "; stat -f "%z bytes" "$BIN" 2>/dev/null || stat -c "%s bytes" "$BIN"
+            echo -n "SHA256: "; shasum -a 256 "$BIN" | awk '{print $1}'
+            echo
+            echo "== file =="; file "$BIN"; echo
+            if [[ $HAVE_LIPO -eq 1 ]]; then echo "== lipo -info =="; lipo -info "$BIN" || true; echo; fi
+            if [[ $HAVE_DWARFDUMP -eq 1 ]]; then echo "== dwarfdump --uuid =="; dwarfdump --uuid "$BIN" || true; echo; fi
+          } > "$OUTDIR/00_overview.txt" 2>&1
+
+          {
+            echo "== otool -hv =="; otool -hv "$BIN"; echo
+            echo "== otool -l (first 400 lines) =="; otool -l "$BIN" | sed -n '1,400p'; echo
+            echo "== LC_RPATH =="; otool -l "$BIN" | awk '/LC_RPATH/{f=1;next} f&&/path/{print $2;f=0}'; echo
+            echo "== LC_ENCRYPTION_INFO(_64) =="; otool -l "$BIN" | awk '/LC_ENCRYPTION_INFO(_64)?/{flag=1} flag&&/crypt/{print} /cmdsize/{if(flag){flag=0}}'; echo
+            echo "== Linked libraries =="; otool -L "$BIN"
+          } > "$OUTDIR/01_loadcmds_links.txt" 2>&1
+
+          {
+            echo "== codesign -dvv --verbose=4 =="; codesign -dvv --verbose=4 "$BIN"; echo
+            echo "== entitlements =="; codesign -d --entitlements :- "$BIN" || echo "(none)"
+          } > "$OUTDIR/02_codesign.txt" 2>&1 || true
+
+          nm -gU "$BIN" 2>/dev/null | sort > "$OUTDIR/03_symbols_global.txt" || true
+          nm -m "$BIN" 2>/dev/null > "$OUTDIR/04_symbols_m.txt" || true
+          strings -a "$BIN" > "$OUTDIR/05_strings_all.txt" 2>/dev/null || true
+          if [[ $HAVE_SWIFT_DEMANGLE -eq 1 ]]; then
+            grep -E '_\$s|\$s' "$OUTDIR/05_strings_all.txt" 2>/dev/null | swift-demangle | sort -u > "$OUTDIR/06_swift_demangled.txt" || true
+          fi
+          grep -Ei 'http[s]?://|wss://|api\.|graphql|/v[0-9]+|bearer |token|secret|key=|x-api-|auth' "$OUTDIR/05_strings_all.txt" 2>/dev/null | sort -u > "$OUTDIR/07_strings_endpoints.txt" || true
+          [[ -f "$FW_DIR/Info.plist" ]] && plutil -convert json "$FW_DIR/Info.plist" -o "$OUTDIR/08_framework_Info.plist.json" || true
+          [[ -f "$APP_PATH/Info.plist" ]] && plutil -convert json "$APP_PATH/Info.plist" -o "$OUTDIR/09_app_Info.plist.json" || true
+
+          ENCRYPT_LINE="$(otool -l "$BIN" | awk '/LC_ENCRYPTION_INFO(_64)?/{f=1} f&&/cryptid/{print $2; exit}')"
+          {
+            echo "AddressDoctor triage summary"
+            echo "============================"
+            echo "Report: $OUTDIR"
+            echo "Binary: $BIN"
+            if [[ "$ENCRYPT_LINE" == "1" ]]; then
+              echo "[!] Encrypted (cryptid 1). Dump a decrypted IPA for full analysis."
+            else
+              echo "[*] Not encrypted (cryptid 0)."
+            fi
+            echo "Key files: 00_overview.txt, 01_loadcmds_links.txt, 02_codesign.txt, 03/04 symbols, 05/07 strings, 08/09 plists"
+          } > "$OUTDIR/SUMMARY.txt"
+
+          echo "$OUTDIR"
+          BASH
+          chmod +x ios_framework_one_shot.sh
+
+      - name: Process IPA(s)
+        id: run
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t LIST <<< "${{ steps.find.outputs.ipalist }}"
+          echo "Found ${#LIST[@]} IPA(s)"
+          mkdir -p reports
+          for IPA in "${LIST[@]}"; do
+            echo "::group::Processing $IPA"
+            OUTDIR="$(./ios_framework_one_shot.sh --ipa "$IPA" | tail -n1)"
+            mv "$OUTDIR" "reports/$(basename "${IPA%.ipa}")-$(date +%Y%m%d-%H%M%S)"
+            echo "::endgroup::"
+          done
+          echo "done=1" >> "$GITHUB_OUTPUT"
+
+      - name: Upload reports artifact
+        if: steps.run.outputs.done == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: addressdoctor-triage-reports
+          path: reports/
+          if-no-files-found: error
